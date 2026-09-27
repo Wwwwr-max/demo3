@@ -1,6 +1,12 @@
 import argparse
 import json
+import os
 from pathlib import Path
+
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True",
+)
 
 from torch.utils.data import DataLoader
 
@@ -36,9 +42,13 @@ def main():
         config["training"]["per_device_eval_batch_size"],
     )
 
-    trainer = Trainer_t(config)
+    trainer = Trainer_t(
+        config,
+        tokenizer_path=adapter_path,
+    )
     model = trainer.set_model(
         resume_adapter_path=adapter_path,
+        is_trainable=False,
     )
 
     test_dataset = trainer.set_data("test")
@@ -52,7 +62,14 @@ def main():
         persistent_workers=trainer.dataloader_num_workers > 0,
     )
 
-    metrics = trainer.evaluate(model, test_loader)
+    metrics = trainer.evaluate(
+        model,
+        test_loader,
+        compute_eval_loss=test_config.get(
+            "compute_eval_loss",
+            False,
+        ),
+    )
 
     print(
         json.dumps(

@@ -1,4 +1,10 @@
 import argparse
+import os
+
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True",
+)
 
 from config import load_config
 from trainer import Trainer_t

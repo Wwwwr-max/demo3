@@ -2,6 +2,7 @@ import contextlib
 import math
 import os
 import random
+from pathlib import Path
 
 import numpy as np
 import swanlab
@@ -18,7 +19,7 @@ from metrics import NERMetric
 
 
 class Trainer_t:
-    def __init__(self, config=None):
+    def __init__(self, config=None, tokenizer_path=None):
         self.config = config or load_config()
         self.model_config = self.config["model"]
         self.data_config = self.config["data"]
@@ -26,7 +27,7 @@ class Trainer_t:
 
         self.device = self.set_device()
         self.set_seed(self.training_config["seed"])
-        self.tokenizer = self.set_tokenizer()
+        self.tokenizer = self.set_tokenizer(tokenizer_path)
 
         self.lr_scheduler = None
         self.scaler = None
@@ -83,20 +84,35 @@ class Trainer_t:
             dtype=self.autocast_dtype,
         )
 
-    def set_tokenizer(self):
+    def set_tokenizer(self, tokenizer_path=None):
+        model_path = self.model_config["model_name_or_path"]
+        if tokenizer_path is not None:
+            tokenizer_dir = Path(tokenizer_path)
+            if (tokenizer_dir / "tokenizer_config.json").exists():
+                model_path = str(tokenizer_dir)
+            else:
+                print(
+                    f"Tokenizer not found in adapter: {tokenizer_dir}. "
+                    "Falling back to the base model tokenizer."
+                )
+
         tokenizer = AutoTokenizer.from_pretrained(
-            self.model_config["model_name_or_path"],
-            use_fast=False,
+            model_path,
+            use_fast=self.model_config.get(
+                "use_fast_tokenizer",
+                True,
+            ),
             trust_remote_code=self.model_config["trust_remote_code"],
             padding_side="right",       #右侧补padding
         )
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
 
-    def set_model(self, resume_adapter_path=None):
+    def set_model(self, resume_adapter_path=None, is_trainable=True):
         model = model_m.Mymodel(
             self.model_config,
             pad_token_id=self.tokenizer.pad_token_id,
+            is_trainable=is_trainable,
             resume_adapter_path=resume_adapter_path,
         )
 
@@ -196,7 +212,12 @@ class Trainer_t:
             "eval_loss": total_eval_loss / len(dev_loader),
         }
 
-    def evaluate(self, model, dev_loader):
+    def evaluate(
+        self,
+        model,
+        dev_loader,
+        compute_eval_loss=False,
+    ):
         was_training = model.training
         model.eval()
         total_eval_loss = 0.0
@@ -217,8 +238,9 @@ class Trainer_t:
                         key: value.to(self.device)
                         for key, value in batch.items()
                     }
-                    outputs = model(**batch)
-                    total_eval_loss += outputs.loss.item()
+                    if compute_eval_loss:
+                        outputs = model(**batch)
+                        total_eval_loss += outputs.loss.item()
 
                     prompt_lengths = []
                     for labels in batch["labels"]:
@@ -291,7 +313,8 @@ class Trainer_t:
                 model.train()
 
         metrics = metric.compute()
-        metrics["eval_loss"] = total_eval_loss / len(dev_loader)
+        if compute_eval_loss:
+            metrics["eval_loss"] = total_eval_loss / len(dev_loader)
         return metrics
 
     def save_checkpoint(
@@ -304,6 +327,7 @@ class Trainer_t:
     ):
         os.makedirs(save_path, exist_ok=True)
         model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
 
         scaler_state = None
         if self.scaler is not None:
@@ -382,6 +406,15 @@ class Trainer_t:
             )
 
         grad_clip_norm = self.training_config["max_grad_norm"]
+        eval_loss_every_n_epochs = max(
+            1,
+            int(
+                self.training_config.get(
+                    "eval_loss_every_n_epochs",
+                    1,
+                )
+            ),
+        )
 
         swanlab.init(
             project=self.training_config["swanlab_project"],
@@ -396,6 +429,7 @@ class Trainer_t:
             unit="step",
             dynamic_ncols=True,
         )
+        last_dev_loss = None
 
         for epoch in range(start_epoch, epochs):
             train_progress.set_description(
@@ -461,19 +495,37 @@ class Trainer_t:
             avg_train_loss = float(
                 total_train_loss / len(train_loader)
             )
-            dev_metrics = self.evaluate_loss(model, dev_loader)
             epoch_log = {
                 "epoch": epoch + 1,
                 "epoch/train_loss": avg_train_loss,
-                "epoch/dev_loss": dev_metrics["eval_loss"],
             }
+
+            should_evaluate_loss = (
+                (epoch + 1) % eval_loss_every_n_epochs == 0
+                or epoch + 1 == epochs
+            )
+            if should_evaluate_loss:
+                dev_metrics = self.evaluate_loss(
+                    model,
+                    dev_loader,
+                )
+                last_dev_loss = dev_metrics["eval_loss"]
+                epoch_log["epoch/dev_loss"] = last_dev_loss
+
             epoch_log.update(self.get_gpu_memory_metrics())
             swanlab.log(epoch_log)
-            print(
-                f"epoch={epoch + 1}, "
-                f"train_loss={avg_train_loss:.4f}, "
-                f"dev_loss={dev_metrics['eval_loss']:.4f}"
-            )
+
+            if should_evaluate_loss:
+                print(
+                    f"epoch={epoch + 1}, "
+                    f"train_loss={avg_train_loss:.4f}, "
+                    f"dev_loss={dev_metrics['eval_loss']:.4f}"
+                )
+            else:
+                print(
+                    f"epoch={epoch + 1}, "
+                    f"train_loss={avg_train_loss:.4f}"
+                )
             save_path = os.path.join(
                 output_dir,
                 f"epoch_{epoch + 1}",
@@ -488,10 +540,18 @@ class Trainer_t:
             print(f"saved checkpoint to {save_path}")
 
         train_progress.close()
-        final_dev_metrics = self.evaluate(model, dev_loader)
+        final_dev_metrics = self.evaluate(
+            model,
+            dev_loader,
+        )
+        loss_text = (
+            f"loss={last_dev_loss:.4f}, "
+            if last_dev_loss is not None
+            else ""
+        )
         print(
             f"final dev: "
-            f"loss={final_dev_metrics['eval_loss']:.4f}, "
+            f"{loss_text}"
             f"P={final_dev_metrics['precision']:.4f}, "
             f"R={final_dev_metrics['recall']:.4f}, "
             f"F1={final_dev_metrics['f1']:.4f}"

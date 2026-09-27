@@ -1,10 +1,15 @@
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
 
 from config import load_config
+
+
+CACHE_VERSION = 1
 
 
 class Mydataset(Dataset):
@@ -26,12 +31,82 @@ class Mydataset(Dataset):
             "Output one entity per line as name:GENE."
             "If there are no entities, output 无实体."
         )
+        self.use_cache = data_config.get("use_cache", True)
+
+        if self.use_cache and self.load_cache():
+            return
+
         with open(self.data_path,"r", encoding="utf-8") as f:
             self.items = json.load(f)
         self.samples = [
             self.encode_item(item)
             for item in self.items
         ]
+        self.save_cache()
+
+    def cache_path(self):
+        data_bytes = self.data_path.read_bytes()
+        fingerprint = {
+            "version": CACHE_VERSION,
+            "data_sha256": hashlib.sha256(data_bytes).hexdigest(),
+            "max_length": self.max_length,
+            "system_prompt": self.system_prompt,
+            "tokenizer_name": getattr(
+                self.tokenizer,
+                "name_or_path",
+                "",
+            ),
+            "tokenizer_size": len(self.tokenizer),
+            "chat_template": str(
+                getattr(self.tokenizer, "chat_template", "")
+            ),
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                fingerprint,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        cache_dir = self.data_path.parent / ".cache"
+        return cache_dir / f"{self.data_path.stem}-{digest}.pt"
+
+    def load_cache(self):
+        cache_path = self.cache_path()
+        if not cache_path.exists():
+            return False
+
+        try:
+            self.samples = torch.load(
+                cache_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except Exception as error:
+            print(
+                f"Failed to load dataset cache {cache_path}: {error}. "
+                "Rebuilding it."
+            )
+            return False
+
+        print(f"Loaded tokenized dataset cache: {cache_path}")
+        return True
+
+    def save_cache(self):
+        if not self.use_cache:
+            return
+
+        cache_path = self.cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_name(
+            f"{cache_path.name}.{os.getpid()}.tmp"
+        )
+        torch.save(self.samples, temporary_path)
+        os.replace(temporary_path, cache_path)
+        print(f"Saved tokenized dataset cache: {cache_path}")
+
     def encode_item(self, item):
         messages = [
             {

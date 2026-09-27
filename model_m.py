@@ -5,6 +5,9 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from liger_kernel.transformers import apply_liger_kernel_to_qwen2
 
 
+_LIGER_TRAINING_INITIALIZED = False
+
+
 class Mymodel(nn.Module):
     def build_lora(self):
         lora_config = LoraConfig(
@@ -33,14 +36,30 @@ class Mymodel(nn.Module):
                 bnb_4bit_use_double_quant=self.quantization["bnb_4bit_use_double_quant"],
             )
     def open_liger_kernel(self):
-        if self.is_trainable:
-            apply_liger_kernel_to_qwen2(           # forward直接输出loss不输出logits
-                rope=self.config["rope"],
-                cross_entropy=self.config["cross_entropy"],
-                fused_linear_cross_entropy=self.config["fused_linear_cross_entropy"],
-                rms_norm=self.config["rms_norm"],
-                swiglu=self.config["swiglu"],
+        global _LIGER_TRAINING_INITIALIZED
+
+        if not self.is_trainable:
+            if _LIGER_TRAINING_INITIALIZED:
+                raise RuntimeError(
+                    "Liger kernel is still enabled in this process. "
+                    "Run evaluation in a separate Python process."
+                )
+            return
+
+        if _LIGER_TRAINING_INITIALIZED:
+            raise RuntimeError(
+                "Liger kernel has already been enabled in this process. "
+                "Run QLoRA and LoRA training in separate Python processes."
             )
+
+        apply_liger_kernel_to_qwen2(           # forward直接输出loss不输出logits
+            rope=self.config["rope"],
+            cross_entropy=self.config["cross_entropy"],
+            fused_linear_cross_entropy=self.config["fused_linear_cross_entropy"],
+            rms_norm=self.config["rms_norm"],
+            swiglu=self.config["swiglu"],
+        )
+        _LIGER_TRAINING_INITIALIZED = True
 
     def __init__(self, config, pad_token_id=None, is_trainable=True, resume_adapter_path=None):
         super().__init__()
@@ -54,6 +73,11 @@ class Mymodel(nn.Module):
             "trust_remote_code": config["trust_remote_code"],       #信任运行仓库里自定义代码
             "torch_dtype": config["torch_dtype"],
         }
+
+        if config.get("attn_implementation") is not None:
+            self.model_kwargs["attn_implementation"] = config[
+                "attn_implementation"
+            ]
 
         self.open_4b_quantify()
 
@@ -70,7 +94,7 @@ class Mymodel(nn.Module):
         if pad_token_id is not None:
             self.model.config.pad_token_id = pad_token_id
 
-        self.model.config.use_cache = False
+        self.model.config.use_cache = not self.is_trainable
 
         if self.quantization is not None and self.is_trainable:
             self.model = prepare_model_for_kbit_training(self.model)
