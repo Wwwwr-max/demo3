@@ -1,6 +1,6 @@
 {
   "model": {
-    "model_name_or_path": "./pretrain/Qwen_7B",
+    "model_name_or_path": "/root/autodl-tmp/pretrain/Qwen_7B",
     "finetuning_type": "lora",
     "lora_rank": 16,
     "lora_alpha": 32,
@@ -21,7 +21,9 @@
     "task_type": "CAUSAL_LM",
     "quantization": null,
     "trust_remote_code": true,
-    "torch_dtype": "auto",
+    "torch_dtype": "bfloat16",
+    "use_fast_tokenizer": true,
+    "attn_implementation": "sdpa",
     "device_map": null,
     "rope": false,
     "cross_entropy": false,
@@ -30,11 +32,12 @@
     "swiglu": true
   },
   "data": {
-    "root_dir": "./data",
+    "root_dir": "/root/autodl-tmp/data",
     "train_file": "bc_train.json",
     "eval_file": "bc_dev.json",
     "test_file": "bc_test.json",
-    "max_seq_length": 768
+    "max_seq_length": 512,
+    "use_cache": true
   },
   "training": {
     "num_train_epochs": 3,
@@ -48,16 +51,18 @@
     "gradient_accumulation_steps": 2,
     "dataloader_num_workers": 4,
     "logging_steps": 20,
+    "eval_loss_every_n_epochs": 3,
     "seed": 42,
     "swanlab_project": "bc2gm_ner_sft",
     "swanlab_exp": "qwen7b_lora_r16_all_linear",
     "output_dir": "./ckpt/7b_lora",
     "fp16": false,
     "bf16": true,
-    "max_new_tokens": 128
+    "max_new_tokens": 64
   },
   "test": {
     "adapter_path": "./ckpt/7b_lora/epoch_3",
-    "batch_size": 4
+    "batch_size": 4,
+    "compute_eval_loss": false
   }
 }
